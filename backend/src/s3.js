@@ -5,4 +5,3 @@ const rawPrefix = process.env.S3_PREFIX ?? "videos/";
 export const PREFIX = rawPrefix && !rawPrefix.endsWith("/") ? rawPrefix + "/" : rawPrefix;
 // Credentials AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env se apne aap pick hote hain
 export const s3 = new S3Client({ region: process.env.AWS_REGION });
--;
