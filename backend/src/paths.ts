@@ -20,10 +20,33 @@ export function snake(input: string, fallback = "unknown", max = 60): string {
     return s || fallback;
 }
 
-// "TT" -> "tt", "17-18" -> "17-18"
+// "TT" -> "tt"
 export function segment(input: string, fallback = "unknown"): string {
     const s = input.toLowerCase().replace(/[^a-z0-9-]+/g, "").replace(/^-+|-+$/g, "");
     return s || fallback;
+}
+
+// "11:00-11:57" -> "11:00-11:57", "11-12" -> "11:00-12:00", "5-6" -> "05:00-06:00"
+export function timingSegment(input: string, fallback = "unknown"): string {
+    if (!input) return fallback;
+    const trimmed = input.trim();
+
+    // Match patterns: 11-12, 17-18, 5-6, 11:00-11:57, 11:00-12:00, 11:00 - 12:00
+    const match = trimmed.match(/^(\d{1,2})(?::(\d{2}))?\s*[-–to]+\s*(\d{1,2})(?::(\d{2}))?$/i);
+    if (match) {
+        const [, h1, m1, h2, m2] = match;
+        const startH = h1.padStart(2, "0");
+        const startM = m1 ?? "00";
+        const endH = h2.padStart(2, "0");
+        const endM = m2 ?? "00";
+        return `${startH}:${startM}-${endH}:${endM}`;
+    }
+
+    const cleaned = trimmed
+        .toLowerCase()
+        .replace(/[^a-z0-9:-]+/g, "")
+        .replace(/^[-:]+|[-:]+$/g, "");
+    return cleaned || fallback;
 }
 
 // "2026-10-17" -> "2026"
@@ -51,7 +74,7 @@ export function buildFolder(batch: BatchInfo, videoDate: string): string {
         snake(batch.courseName),
         snake(batch.teacherName),
         segment(batch.schedule),
-        segment(batch.timing),
+        timingSegment(batch.timing),
         yearFolder(videoDate),
         monthFolder(videoDate),
     ];
