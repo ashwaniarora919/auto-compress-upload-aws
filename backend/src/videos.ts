@@ -9,12 +9,12 @@ import {
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { s3, BUCKET } from "./s3.js";
-import { db, type VideoRow, type BatchRow } from "./db.js";
+import { query, getRecordingById, getBatchById, type VideoRow } from "./db.js";
 import { buildFolder, buildFileBase } from "./paths.js";
 
-const MAX_VIDEO_BYTES = 200 * 1024 * 1024; // 200 MB (short clips ke liye kaafi)
+const MAX_VIDEO_BYTES = 200 * 1024 * 1024; // 200 MB
 const MAX_THUMB_BYTES = 5 * 1024 * 1024; // 5 MB
-const URL_TTL_SECONDS = 60 * 60; // presigned link 1 ghante tak chalega
+const URL_TTL_SECONDS = 60 * 60; // 1 hour
 
 const VIDEO_EXT: Record<string, string> = {
     "video/mp4": "mp4",
@@ -48,39 +48,70 @@ function presignGet(key: string) {
     });
 }
 
+function extractS3Key(urlOrKey: string, bucket: string): string {
+    if (!urlOrKey.startsWith("http")) return urlOrKey;
+    try {
+        const url = new URL(urlOrKey);
+        let key = decodeURIComponent(url.pathname.replace(/^\/+/, ""));
+        if (key.startsWith(`${bucket}/`)) {
+            key = key.slice(bucket.length + 1);
+        }
+        return key;
+    } catch {
+        return urlOrKey;
+    }
+}
+
 async function toDto(row: VideoRow) {
+    let thumbUrl: string | null = null;
+    if (row.thumbnail_key) {
+        try {
+            thumbUrl = await presignGet(row.thumbnail_key);
+        } catch {
+            thumbUrl = null;
+        }
+    }
+
+    const dateStr =
+        typeof row.date === "string"
+            ? row.date.slice(0, 10)
+            : row.date instanceof Date
+            ? row.date.toISOString().slice(0, 10)
+            : "";
+
     return {
         id: row.id,
         title: row.title,
-        description: row.description,
-        videoDate: row.video_date,
-        originalFilename: row.original_filename,
-        originalSize: row.original_size,
-        compressedSize: row.compressed_size,
-        mimeType: row.mime_type,
-        thumbnailUrl: row.thumbnail_key ? await presignGet(row.thumbnail_key) : null,
-        batch:
-            row.batch_id && row.course_name
-                ? {
-                    id: row.batch_id,
-                    courseName: row.course_name,
-                    teacherName: row.teacher_name ?? "",
-                    schedule: row.schedule ?? "",
-                    timing: row.timing ?? "",
-                }
-                : null,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at,
+        description: row.description ?? "",
+        videoDate: dateStr,
+        originalFilename: row.original_filename ?? "",
+        originalSize: Number(row.original_size ?? 0),
+        compressedSize: Number(row.compressed_size ?? 0),
+        mimeType: row.mime_type ?? "video/mp4",
+        thumbnailUrl: thumbUrl,
+        batch: row.course_name
+            ? {
+                  id: row.schedule_id ?? "",
+                  courseName: row.course_name,
+                  teacherName: row.teacher_name ?? "",
+                  schedule: row.schedule ?? "",
+                  timing: row.timing ?? "",
+              }
+            : null,
+        createdAt:
+            row.created_at instanceof Date
+                ? row.created_at.toISOString()
+                : String(row.created_at ?? ""),
+        updatedAt:
+            row.updated_at instanceof Date
+                ? row.updated_at.toISOString()
+                : String(row.updated_at ?? ""),
     };
-}
-
-function getRow(id: string) {
-    return db.prepare("SELECT * FROM videos WHERE id = ?").get(id) as VideoRow | undefined;
 }
 
 export const videos = new Hono();
 
-// 1) Upload
+// 1) Upload Video
 videos.post(
     "/",
     bodyLimit({
@@ -131,22 +162,23 @@ videos.post(
         }
         const meta = parsed.data;
 
-        // Batch ki details database se aati hain, client se nahi
-        const batch = db.prepare("SELECT * FROM batches WHERE id = ?").get(meta.batchId) as
-            | BatchRow
-            | undefined;
+        // Fetch batch details from schedule table
+        const batch = await getBatchById(meta.batchId);
         if (!batch) {
             return c.json({ error: "Invalid fields", details: ["Selected batch was not found"] }, 400);
         }
 
-        // Key: videos/entry/<course>/<schedule>/<timing>/<month>/<title>_<id>.mp4
         const id = randomUUID();
+        const daysStr = Array.isArray(batch.days)
+            ? batch.days.join(", ")
+            : batch.schedule || batch.days || "general";
+
         const folder = buildFolder(
             {
-                courseName: batch.course_name,
-                teacherName: batch.teacher_name,
-                schedule: batch.schedule,
-                timing: batch.timing,
+                courseName: batch.course_name || "course",
+                teacherName: batch.teacher_name || "teacher",
+                schedule: daysStr,
+                timing: batch.timing || "timing",
             },
             meta.videoDate
         );
@@ -178,85 +210,164 @@ videos.post(
                 uploadedKeys.push(thumbKey);
             }
 
-            const now = new Date().toISOString();
-            db.prepare(
-                `INSERT INTO videos
-          (id, title, description, video_date, s3_key, thumbnail_key,
-           original_filename, original_size, compressed_size, mime_type,
-           created_at, updated_at, batch_id, course_name, teacher_name, schedule, timing)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-            ).run(
-                id,
-                meta.title,
-                meta.description,
-                meta.videoDate,
-                videoKey,
-                thumbKey,
-                meta.originalFilename,
-                meta.originalSize,
-                video.size,
-                video.type,
-                now,
-                now,
-                batch.id,
-                batch.course_name,
-                batch.teacher_name,
-                batch.schedule,
-                batch.timing
+            const region = process.env.AWS_REGION || "ap-south-1";
+            const videoUrl = `https://${BUCKET}.s3.${region}.amazonaws.com/${videoKey}`;
+
+            // Calculate order
+            const orderRes = await query<{ next_order: number }>(
+                `SELECT COALESCE(MAX("order"), 0) + 1 AS next_order FROM recording WHERE schedule_id = $1`,
+                [batch.id]
+            );
+            const nextOrder = orderRes[0]?.next_order ?? 1;
+
+            // Store in recording table in PostgreSQL
+            await query(
+                `INSERT INTO recording (
+                    id,
+                    schedule_id,
+                    course_id,
+                    teacher_id,
+                    title,
+                    description,
+                    video_url,
+                    "order",
+                    date,
+                    thumbnail_key,
+                    original_filename,
+                    original_size,
+                    compressed_size,
+                    mime_type,
+                    created_at,
+                    updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW())`,
+                [
+                    id,
+                    batch.id,
+                    batch.course_id,
+                    batch.teacher_id,
+                    meta.title,
+                    meta.description,
+                    videoUrl,
+                    nextOrder,
+                    meta.videoDate,
+                    thumbKey,
+                    meta.originalFilename,
+                    meta.originalSize,
+                    video.size,
+                    video.type,
+                ]
             );
 
-            console.log("Uploaded to S3:", videoKey);
+            console.log("Uploaded to S3 and stored in Neon DB:", videoUrl);
 
-            const row = getRow(id)!;
+            const row = await getRecordingById(id);
+            if (!row) {
+                throw new Error("Failed to retrieve newly created recording");
+            }
             return c.json({ video: await toDto(row) }, 201);
         } catch (e: any) {
             console.error("Upload failed:", e);
-            // Kuch fail hua to S3 pe jo upload ho chuka tha use hata do
             await Promise.allSettled(
                 uploadedKeys.map((Key) => s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key })))
             );
-            return c.json({ error: "Upload failed", detail: e?.name ?? "UnknownError" }, 500);
+            return c.json({ error: "Upload failed", detail: e?.message ?? e?.name ?? "UnknownError" }, 500);
         }
     }
 );
 
-// 2) List
+// 2) List All Videos (from recording table)
 videos.get("/", async (c) => {
-    const rows = db
-        .prepare("SELECT * FROM videos ORDER BY video_date DESC, created_at DESC")
-        .all() as VideoRow[];
-    const list = await Promise.all(rows.map(toDto));
-    return c.json({ videos: list });
+    try {
+        const rows = await query<VideoRow>(
+            `SELECT 
+                r.*,
+                c.title AS course_name,
+                t.full_name AS teacher_name,
+                s.timing,
+                array_to_string(s.days, ', ') AS schedule
+            FROM recording r
+            LEFT JOIN course c ON r.course_id = c.id
+            LEFT JOIN teacher t ON r.teacher_id = t.id
+            LEFT JOIN schedule s ON r.schedule_id = s.id
+            ORDER BY r.created_at DESC, r.date DESC
+            LIMIT 200`
+        );
+        const list = await Promise.all(rows.map(toDto));
+        return c.json({ videos: list });
+    } catch (err: any) {
+        console.error("Failed to list videos:", err);
+        return c.json({ error: "Failed to list videos", detail: err?.message }, 500);
+    }
 });
 
 // 3) Playback URL
 videos.get("/:id/playback-url", async (c) => {
-    const row = getRow(c.req.param("id"));
-    if (!row) return c.json({ error: "Video not found" }, 404);
-    const url = await presignGet(row.s3_key);
-    return c.json({ url, expiresInSeconds: URL_TTL_SECONDS });
-});
-
-// Sirf browser mein test ke liye: seedha video pe redirect
-videos.get("/:id/play", async (c) => {
-    const row = getRow(c.req.param("id"));
-    if (!row) return c.json({ error: "Video not found" }, 404);
-    return c.redirect(await presignGet(row.s3_key));
-});
-
-// 4) Delete
-videos.delete("/:id", async (c) => {
-    const row = getRow(c.req.param("id"));
-    if (!row) return c.json({ error: "Video not found" }, 404);
     try {
-        const keys = [row.s3_key, ...(row.thumbnail_key ? [row.thumbnail_key] : [])];
-        for (const Key of keys) {
-            await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key }));
+        const row = await getRecordingById(c.req.param("id"));
+        if (!row) return c.json({ error: "Video not found" }, 404);
+
+        let url = row.video_url;
+        // If the video belongs to our configured S3 bucket or is an S3 key, presign it
+        if (row.video_url.includes(BUCKET) || !row.video_url.startsWith("http")) {
+            const key = extractS3Key(row.video_url, BUCKET);
+            try {
+                url = await presignGet(key);
+            } catch {
+                url = row.video_url;
+            }
         }
-        db.prepare("DELETE FROM videos WHERE id = ?").run(row.id);
+        return c.json({ url, expiresInSeconds: URL_TTL_SECONDS });
+    } catch (err: any) {
+        console.error("Error generating playback url:", err);
+        return c.json({ error: "Playback error", detail: err?.message }, 500);
+    }
+});
+
+// Direct browser redirect
+videos.get("/:id/play", async (c) => {
+    const row = await getRecordingById(c.req.param("id"));
+    if (!row) return c.json({ error: "Video not found" }, 404);
+
+    let url = row.video_url;
+    if (row.video_url.includes(BUCKET) || !row.video_url.startsWith("http")) {
+        const key = extractS3Key(row.video_url, BUCKET);
+        try {
+            url = await presignGet(key);
+        } catch {
+            url = row.video_url;
+        }
+    }
+    return c.redirect(url);
+});
+
+// 4) Delete Video
+videos.delete("/:id", async (c) => {
+    const id = c.req.param("id");
+    try {
+        const row = await getRecordingById(id);
+        if (!row) return c.json({ error: "Video not found" }, 404);
+
+        // Delete from S3 if in our bucket
+        const keysToDelete: string[] = [];
+        if (row.video_url.includes(BUCKET) || !row.video_url.startsWith("http")) {
+            keysToDelete.push(extractS3Key(row.video_url, BUCKET));
+        }
+        if (row.thumbnail_key) {
+            keysToDelete.push(row.thumbnail_key);
+        }
+
+        for (const Key of keysToDelete) {
+            try {
+                await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key }));
+            } catch (s3Err) {
+                console.warn("Could not delete S3 object:", Key, s3Err);
+            }
+        }
+
+        await query("DELETE FROM recording WHERE id = $1", [id]);
         return c.json({ ok: true });
     } catch (e: any) {
         console.error("Delete failed:", e);
-        return c.json({ error: "Delete failed", detail: e?.name ?? "UnknownError" }, 500);
+        return c.json({ error: "Delete failed", detail: e?.message ?? "UnknownError" }, 500);
     }
 });

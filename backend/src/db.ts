@@ -1,85 +1,99 @@
-import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
+import { query, type QueryResultRow } from "./pgdb.js";
 
-mkdirSync("data", { recursive: true });
-
-export const db = new DatabaseSync("data/videos.db");
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS batches (
-    id TEXT PRIMARY KEY,
-    course_name TEXT NOT NULL,
-    teacher_name TEXT NOT NULL,
-    schedule TEXT NOT NULL,
-    timing TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS videos (
-    id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    video_date TEXT NOT NULL,
-    s3_key TEXT NOT NULL,
-    thumbnail_key TEXT,
-    original_filename TEXT NOT NULL,
-    original_size INTEGER NOT NULL,
-    compressed_size INTEGER NOT NULL,
-    mime_type TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-`);
-
-// Purani videos table mein naye columns jodna (purana data delete nahi hoga)
-const existingColumns = db.prepare("PRAGMA table_info(videos)").all() as { name: string }[];
-for (const [name, type] of [
-  ["batch_id", "TEXT"],
-  ["course_name", "TEXT"],
-  ["teacher_name", "TEXT"],
-  ["schedule", "TEXT"],
-  ["timing", "TEXT"],
-] as const) {
-  if (!existingColumns.some((c) => c.name === name)) {
-    db.exec(`ALTER TABLE videos ADD COLUMN ${name} ${type}`);
-  }
-}
-
-// Demo ke liye sample batches (real app mein ye admin side se aayenge)
-const batchCount = db.prepare("SELECT COUNT(*) AS n FROM batches").get() as { n: number };
-if (batchCount.n === 0) {
-  const insert = db.prepare(
-    "INSERT INTO batches (id, course_name, teacher_name, schedule, timing) VALUES (?, ?, ?, ?, ?)"
-  );
-  insert.run("batch-1", "Semi Classical Dance", "Anjali Sharma", "tt", "17-18");
-  insert.run("batch-2", "Semi Classical Dance", "Anjali Sharma", "mwf", "11-12");
-  insert.run("batch-3", "Hip Hop", "Rohit Verma", "ss", "10-11");
-  insert.run("batch-4", "Yoga", "Meera Iyer", "mtwtf", "06-07");
-}
-
+/* Types matching Neon DB tables: schedule, course, teacher, recording */
 export type BatchRow = {
-  id: string;
-  course_name: string;
-  teacher_name: string;
-  schedule: string;
+  id: string; // schedule_id
   timing: string;
+  days: string[] | string | null;
+  course_id: string | null;
+  teacher_id: string | null;
+  course_name: string | null;
+  teacher_name: string | null;
+  schedule?: string | null;
 };
 
 export type VideoRow = {
   id: string;
+  schedule_id: string | null;
+  course_id: string | null;
+  teacher_id: string | null;
   title: string;
-  description: string;
-  video_date: string;
-  s3_key: string;
+  description: string | null;
+  video_url: string;
+  order: number;
+  date: string | Date;
+  created_at: string | Date;
+  updated_at: string | Date;
   thumbnail_key: string | null;
-  original_filename: string;
-  original_size: number;
-  compressed_size: number;
-  mime_type: string;
-  created_at: string;
-  updated_at: string;
-  batch_id: string | null;
-  course_name: string | null;
-  teacher_name: string | null;
-  schedule: string | null;
-  timing: string | null;
+  original_filename: string | null;
+  original_size: number | string | null;
+  compressed_size: number | string | null;
+  mime_type: string | null;
+  course_name?: string | null;
+  teacher_name?: string | null;
+  timing?: string | null;
+  schedule?: string | null;
 };
+
+// Helper to fetch a single recording row by id with joined course & teacher
+export async function getRecordingById(id: string): Promise<VideoRow | undefined> {
+  const rows = await query<VideoRow>(
+    `SELECT 
+       r.*,
+       c.title AS course_name,
+       t.full_name AS teacher_name,
+       s.timing,
+       array_to_string(s.days, ', ') AS schedule
+     FROM recording r
+     LEFT JOIN course c ON r.course_id = c.id
+     LEFT JOIN teacher t ON r.teacher_id = t.id
+     LEFT JOIN schedule s ON r.schedule_id = s.id
+     WHERE r.id = $1`,
+    [id]
+  );
+  return rows[0];
+}
+
+// Helper to fetch all batches / active schedules
+export async function getAllBatches(): Promise<BatchRow[]> {
+  const rows = await query<BatchRow>(
+    `SELECT 
+       s.id,
+       s.timing,
+       s.days,
+       s.course_id,
+       s.teacher_id,
+       c.title AS course_name,
+       t.full_name AS teacher_name,
+       array_to_string(s.days, ', ') AS schedule
+     FROM schedule s
+     LEFT JOIN course c ON s.course_id = c.id
+     LEFT JOIN teacher t ON s.teacher_id = t.id
+     WHERE s.status = 'ACTIVE' OR s.status IS NULL
+     ORDER BY c.title ASC NULLS LAST, s.timing ASC`
+  );
+  return rows;
+}
+
+// Helper to fetch single batch by schedule id
+export async function getBatchById(id: string): Promise<BatchRow | undefined> {
+  const rows = await query<BatchRow>(
+    `SELECT 
+       s.id,
+       s.timing,
+       s.days,
+       s.course_id,
+       s.teacher_id,
+       c.title AS course_name,
+       t.full_name AS teacher_name,
+       array_to_string(s.days, ', ') AS schedule
+     FROM schedule s
+     LEFT JOIN course c ON s.course_id = c.id
+     LEFT JOIN teacher t ON s.teacher_id = t.id
+     WHERE s.id = $1`,
+    [id]
+  );
+  return rows[0];
+}
+
+export { query, type QueryResultRow };
